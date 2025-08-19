@@ -7,6 +7,8 @@ import threading
 import subprocess
 import platform
 from pathlib import Path
+import ast
+import importlib.util
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -23,6 +25,7 @@ class PackagerGUI(tk.Tk):
         self.entry_script_var = tk.StringVar()
         self.output_dir_var = tk.StringVar(value=str(Path.cwd() / "dist"))
         self.icon_path_var = tk.StringVar()
+        self.app_name_var = tk.StringVar()
         self.onefile_var = tk.BooleanVar(value=True)
         self.windowed_var = tk.BooleanVar(value=False)
         self.clean_var = tk.BooleanVar(value=True)
@@ -75,6 +78,11 @@ class PackagerGUI(tk.Tk):
         icon_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
         ttk.Button(row2, text="选择...", command=self._choose_icon_file).pack(side=tk.LEFT)
 
+        row2b = ttk.Frame(top)
+        row2b.pack(fill=tk.X, padx=8, pady=6)
+        ttk.Label(row2b, text="应用名称").pack(side=tk.LEFT)
+        ttk.Entry(row2b, textvariable=self.app_name_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
+
         # Options
         opts = ttk.LabelFrame(container, text="打包选项")
         opts.pack(fill=tk.X, pady=(10, 0))
@@ -121,6 +129,7 @@ class PackagerGUI(tk.Tk):
         self.hidden_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
         ttk.Button(hidden_btns, text="添加", command=self._add_hidden_import).pack(side=tk.LEFT, padx=4)
         ttk.Button(hidden_btns, text="删除", command=self._remove_hidden_import).pack(side=tk.LEFT)
+        ttk.Button(hidden_btns, text="依赖分析", command=self._auto_analyze_and_fill_hidden).pack(side=tk.LEFT, padx=4)
 
         data_frame = ttk.Frame(mid)
         data_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(16, 0))
@@ -138,6 +147,7 @@ class PackagerGUI(tk.Tk):
         actions.pack(fill=tk.X, pady=10)
         self.pack_btn = ttk.Button(actions, text="开始打包", command=self._on_pack_clicked)
         self.pack_btn.pack(side=tk.LEFT)
+        ttk.Button(actions, text="生成spec", command=self._on_make_spec_clicked).pack(side=tk.LEFT, padx=6)
         self.cancel_btn = ttk.Button(actions, text="取消", command=self._on_cancel_clicked, state=tk.DISABLED)
         self.cancel_btn.pack(side=tk.LEFT, padx=6)
         ttk.Button(actions, text="显示命令", command=self._show_command).pack(side=tk.LEFT, padx=6)
@@ -319,6 +329,10 @@ class PackagerGUI(tk.Tk):
         # Use module invocation to avoid PATH issues
         cmd: list[str] = [sys.executable, "-m", "PyInstaller"]
 
+        app_name = self.app_name_var.get().strip()
+        if app_name:
+            cmd.extend(["--name", app_name])
+
         if self.onefile_var.get():
             cmd.append("--onefile")
         if self.windowed_var.get():
@@ -373,6 +387,141 @@ class PackagerGUI(tk.Tk):
         cmd.append(self.entry_script_var.get().strip())
 
         return cmd
+
+    def _build_makespec_command(self) -> list[str]:
+        cmd: list[str] = [sys.executable, "-m", "PyInstaller.utils.cliutils.makespec"]
+
+        app_name = self.app_name_var.get().strip()
+        if app_name:
+            cmd.extend(["--name", app_name])
+
+        if self.onefile_var.get():
+            cmd.append("--onefile")
+        if self.windowed_var.get():
+            cmd.append("--windowed")
+
+        icon_path = self.icon_path_var.get().strip()
+        if icon_path:
+            cmd.append(f"--icon={icon_path}")
+
+        # Hidden imports
+        for mod in self.hidden_imports:
+            cmd.extend(["--hidden-import", mod])
+
+        # Data files
+        sep = ";" if platform.system() == "Windows" else ":"
+        for src, dest in self.data_mappings:
+            mapping = f"{src}{sep}{dest}"
+            cmd.extend(["--add-data", mapping])
+
+        # Spec path
+        out_dir = self.output_dir_var.get().strip() or str(Path.cwd() / "dist")
+        spec_dir = str(Path(out_dir) / ".spec")
+        Path(spec_dir).mkdir(parents=True, exist_ok=True)
+        cmd.extend(["--specpath", spec_dir])
+
+        # Additional args
+        extra = self.additional_args_var.get().strip()
+        if extra:
+            try:
+                cmd.extend(shlex.split(extra))
+            except ValueError:
+                cmd.append(extra)
+
+        # Entry script
+        cmd.append(self.entry_script_var.get().strip())
+        return cmd
+
+    def _on_make_spec_clicked(self) -> None:
+        if self.is_running:
+            return
+        entry_script = self.entry_script_var.get().strip()
+        if not entry_script:
+            messagebox.showerror("错误", "请先选择入口脚本 (.py)")
+            return
+        if not os.path.isfile(entry_script):
+            messagebox.showerror("错误", "入口脚本不存在")
+            return
+
+        cmd = self._build_makespec_command()
+        self._append_log_line("$ " + self._format_cmd_for_display(cmd))
+
+        self.is_running = True
+        self._set_running_state(True)
+        self.current_process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            universal_newlines=True,
+            cwd=str(Path(entry_script).parent),
+        )
+
+        threading.Thread(target=self._pump_process_output, daemon=True).start()
+        threading.Thread(target=self._wait_for_process_end, daemon=True).start()
+
+    def _auto_analyze_and_fill_hidden(self) -> None:
+        entry_script = self.entry_script_var.get().strip()
+        if not entry_script or not os.path.isfile(entry_script):
+            messagebox.showerror("错误", "请先选择有效的入口脚本 (.py)")
+            return
+
+        try:
+            imports = self._collect_top_level_imports(entry_script)
+        except Exception as exc:
+            messagebox.showerror("错误", f"依赖分析失败: {exc}")
+            return
+
+        # Filter: exclude built-in and stdlib
+        stdlib_names = set()
+        if hasattr(sys, "stdlib_module_names"):
+            try:
+                stdlib_names = set(sys.stdlib_module_names)  # type: ignore[attr-defined]
+            except Exception:
+                stdlib_names = set()
+
+        builtin_names = set(sys.builtin_module_names)
+
+        suggestions: list[str] = []
+        for name in sorted(imports):
+            if name.startswith("."):
+                continue
+            root = name.split(".", 1)[0]
+            if root in builtin_names or root in stdlib_names:
+                continue
+            suggestions.append(root)
+
+        added = 0
+        for mod in suggestions:
+            if mod not in self.hidden_imports:
+                self.hidden_imports.append(mod)
+                self.hidden_list.insert(tk.END, mod)
+                added += 1
+
+        self._append_log_line(f"[分析] 建议隐藏依赖共 {len(suggestions)} 个，新增 {added} 个")
+
+    def _collect_top_level_imports(self, file_path: str) -> set[str]:
+        with open(file_path, "r", encoding="utf-8") as f:
+            source = f.read()
+        tree = ast.parse(source, filename=file_path)
+
+        imports: set[str] = set()
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name:
+                        imports.add(alias.name)
+            elif isinstance(node, ast.ImportFrom):
+                if node.module:
+                    base = ("." * node.level) + node.module if node.level else node.module
+                    imports.add(base)
+                else:
+                    # from . import something
+                    imports.add("." * max(1, node.level))
+
+        return imports
 
     def _show_command(self) -> None:
         try:
